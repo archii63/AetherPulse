@@ -1,0 +1,262 @@
+# KERNALYT
+
+# Log Intelligence & Error Analytics
+
+# Version: 1.0.0
+
+# Runtime: Python 3.10+
+
+from **future** import annotations
+
+import argparse
+import json
+import re
+import sys
+
+from collections import Counter
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "1.0.0"
+
+LEVEL_PATTERN = re.compile(
+r"\b(DEBUG|INFO|WARN|WARNING|ERROR|CRITICAL|FATAL)\b",
+re.IGNORECASE,
+)
+
+TIMESTAMP_PATTERN = re.compile(
+r"^\(?(\d{4}-\d{2}-\d{2}[T ][\d:.+-]+Z?)\)?"
+)
+
+DEFAULT_IGNORED = {"DEBUG", "INFO"}
+
+@dataclass
+class LogEntry:
+line_number: int
+level: str
+message: str
+fingerprint: str
+
+def normalize_message(message: str) -> str:
+"""Normalize variable values to group similar log messages."""
+message = re.sub(r"\b0x[0-9a-fA-F]+\b", "<HEX>", message)
+message = re.sub(r"\b\d+\b", "<NUM>", message)
+message = re.sub(
+r"\b[a-fA-F0-9]{8}-[a-fA-F0-9-]{27,}\b",
+"<UUID>",
+message,
+)
+message = re.sub(
+r"[\w.+-]+@[\w.-]+.[A-Za-z]{2,}",
+"<EMAIL>",
+message,
+)
+message = re.sub(r"\s+", " ", message).strip()
+
+```
+return message
+```
+
+def parse_line(line: str, line_number: int) -> LogEntry:
+"""Extract a severity level and message from a log line."""
+match = LEVEL_PATTERN.search(line)
+
+```
+level = match.group(1).upper() if match else "UNKNOWN"
+
+if level == "WARNING":
+    level = "WARN"
+elif level == "FATAL":
+    level = "CRITICAL"
+
+message = line.strip()
+
+timestamp_match = TIMESTAMP_PATTERN.match(message)
+if timestamp_match:
+    message = message[timestamp_match.end():].strip()
+
+if match:
+    relative_start = match.start()
+    message = line[match.end():].strip()
+
+    # Remove common separators following the severity level.
+    message = re.sub(r"^[\s:\]\-]+", "", message)
+
+    # Preserve the original message if extraction is empty.
+    if not message:
+        message = line[relative_start:].strip()
+
+normalized = normalize_message(message)
+
+return LogEntry(
+    line_number=line_number,
+    level=level,
+    message=message,
+    fingerprint=normalized or "<EMPTY>",
+)
+```
+
+def analyze_file(
+file_path: Path,
+include_info: bool = False,
+) -> dict:
+"""Analyze a UTF-8 log file and produce a structured report."""
+if not file_path.exists():
+raise FileNotFoundError(f"File not found: {file_path}")
+
+```
+if not file_path.is_file():
+    raise ValueError(f"Path is not a file: {file_path}")
+
+entries: list[LogEntry] = []
+
+with file_path.open("r", encoding="utf-8", errors="replace") as handle:
+    for line_number, line in enumerate(handle, start=1):
+        if not line.strip():
+            continue
+
+        entries.append(parse_line(line, line_number))
+
+ignored_levels = set() if include_info else DEFAULT_IGNORED
+
+relevant = [
+    entry for entry in entries
+    if entry.level not in ignored_levels
+]
+
+level_counts = Counter(entry.level for entry in entries)
+fingerprints = Counter(
+    entry.fingerprint
+    for entry in relevant
+    if entry.level in {"ERROR", "CRITICAL", "WARN"}
+)
+
+first_seen: dict[str, int] = {}
+examples: dict[str, str] = {}
+
+for entry in relevant:
+    if entry.level in {"ERROR", "CRITICAL", "WARN"}:
+        first_seen.setdefault(entry.fingerprint, entry.line_number)
+        examples.setdefault(entry.fingerprint, entry.message)
+
+recurring_issues = [
+    {
+        "fingerprint": fingerprint,
+        "count": count,
+        "first_line": first_seen[fingerprint],
+        "example": examples[fingerprint],
+    }
+    for fingerprint, count in fingerprints.most_common()
+]
+
+error_count = level_counts["ERROR"] + level_counts["CRITICAL"]
+warning_count = level_counts["WARN"]
+
+return {
+    "tool": "KERNALYT",
+    "version": VERSION,
+    "analyzed_at": datetime.now(timezone.utc).isoformat(),
+    "source": file_path.name,
+    "summary": {
+        "total_lines": len(entries),
+        "error_count": error_count,
+        "warning_count": warning_count,
+        "unique_issue_count": len(fingerprints),
+    },
+    "levels": dict(sorted(level_counts.items())),
+    "recurring_issues": recurring_issues,
+}
+```
+
+def render_text(report: dict) -> str:
+"""Render a readable report for terminal output."""
+summary = report["summary"]
+lines = [
+f"KERNALYT Log Analytics v{VERSION}",
+"=" * 48,
+f"Source: {report['source']}",
+f"Total log lines: {summary['total_lines']}",
+f"Errors: {summary['error_count']}",
+f"Warnings: {summary['warning_count']}",
+f"Unique issues: {summary['unique_issue_count']}",
+"",
+"Recurring Issues",
+"-" * 48,
+]
+
+```
+issues = report["recurring_issues"]
+
+if not issues:
+    lines.append("No warnings or errors detected.")
+else:
+    for index, issue in enumerate(issues, start=1):
+        lines.extend([
+            f"{index}. Occurrences: {issue['count']}",
+            f"   First line: {issue['first_line']}",
+            f"   Pattern: {issue['fingerprint']}",
+            f"   Example: {issue['example'][:240]}",
+            "",
+        ])
+
+return "\n".join(lines)
+```
+
+def main() -> int:
+parser = argparse.ArgumentParser(
+prog="kernalyt",
+description="Analyze logs and identify recurring issues.",
+)
+
+```
+parser.add_argument("file", type=Path, help="Path to a log file.")
+parser.add_argument(
+    "--json",
+    action="store_true",
+    help="Output the report as JSON.",
+)
+parser.add_argument(
+    "--output",
+    type=Path,
+    help="Write the report to a file.",
+)
+parser.add_argument(
+    "--include-info",
+    action="store_true",
+    help="Include DEBUG and INFO entries in issue analysis.",
+)
+
+args = parser.parse_args()
+
+try:
+    report = analyze_file(
+        args.file,
+        include_info=args.include_info,
+    )
+
+    output = (
+        json.dumps(report, indent=2, ensure_ascii=False)
+        if args.json
+        else render_text(report)
+    )
+
+    if args.output:
+        args.output.write_text(output + "\n", encoding="utf-8")
+        print(f"Report written to {args.output}")
+    else:
+        print(output)
+
+    return 0
+
+except (OSError, ValueError) as exc:
+    print(f"Error: {exc}", file=sys.stderr)
+    return 1
+```
+
+if **name** == "**main**":
+try:
+sys.exit(main())
+except KeyboardInterrupt:
+print("\nAnalysis interrupted.", file=sys.stderr)
+sys.exit(130)
